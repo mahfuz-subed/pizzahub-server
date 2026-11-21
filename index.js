@@ -21,9 +21,16 @@ export async function connectToMongoDB() {
 
 const mongoClient = await connectToMongoDB();
 const db = mongoClient.db("pizzahubDB");
+const menuCollection = db.collection("menu");
 
 app.get("/", (req, res) => {
   res.send("Hello World!");
+});
+
+app.post("/add-menu", async (req, res) => {
+  const data = req.body;
+  const result = await menuCollection.insertOne(data);
+  res.send(result);
 });
 
 app.listen(port, () => {
