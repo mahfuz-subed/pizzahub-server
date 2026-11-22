@@ -77,6 +77,23 @@ app.get("/my-menu-items", async (req, res) => {
   res.json(result);
 });
 
+// GET /menu/categories  -  how many approved items each category has
+app.get("/menu/categories", async (req, res) => {
+  try {
+    const counts = await menuCollection
+      .aggregate([
+        { $match: { status: "approved" } },
+
+        { $group: { _id: "$category", count: { $sum: 1 } } },
+      ])
+      .toArray();
+
+    res.send(counts);
+  } catch {
+    res.status(500).send({ error: "Could not load categories." });
+  }
+});
+
 // Update a menu item (also used to toggle availability via "status")
 app.put("/update-menu-item/:id", async (req, res) => {
   const { vendorId, ...updates } = req.body;
