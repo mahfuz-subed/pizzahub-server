@@ -76,13 +76,26 @@ app.get("/menu", async (req, res) => {
   res.send(result);
 });
 
-// app.get("menuDetails/:id", async (req, res) => {
-//   const result = await menuCollection.findOneAndDelete({
-//     _id: new ObjectId(id),
-//     status: "approved",
-//   });
-//   res.send(result);
-// });
+// One approved item for the details page.
+app.get("/menuDetails/:id", async (req, res) => {
+  const { id } = req.params;
+
+  // Return 404 (not 400) so the page shows its friendly "not found" message.
+  if (!ObjectId.isValid(id)) {
+    return res.status(404).send({ error: "Menu item not found." });
+  }
+
+  const item = await menuCollection.findOne({
+    _id: new ObjectId(id),
+    status: "approved",
+  });
+
+  if (!item) {
+    return res.status(404).send({ error: "Menu item not found." });
+  }
+
+  res.send(item);
+});
 
 app.get("/my-menu-items", async (req, res) => {
   const vendorId = req.query.vendorId;
