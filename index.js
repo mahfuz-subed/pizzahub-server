@@ -42,7 +42,21 @@ app.post("/add-menu", async (req, res) => {
 });
 
 app.get("/menu", async (req, res) => {
-  const result = await menuCollection.find().toArray();
+  const result = await menuCollection
+    .aggregate([
+      { $match: { status: "approved" } },
+      {
+        $lookup: {
+          from: "user",
+          localField: "vendorId",
+          foreignField: "_id",
+          as: "vendor",
+        },
+      },
+      { $unwind: { path: "$vendor", preserveNullAndEmptyArrays: true } },
+      { $sort: { createdAt: -1 } },
+    ])
+    .toArray();
   res.send(result);
 });
 app.get("/my-menu-items", async (req, res) => {
@@ -67,8 +81,14 @@ app.get("/my-menu-items", async (req, res) => {
 app.put("/update-menu-item/:id", async (req, res) => {
   const { vendorId, ...updates } = req.body;
 
-  if (!vendorId || !ObjectId.isValid(vendorId) || !ObjectId.isValid(req.params.id)) {
-    return res.status(400).send({ error: "A valid vendor id and item id are required." });
+  if (
+    !vendorId ||
+    !ObjectId.isValid(vendorId) ||
+    !ObjectId.isValid(req.params.id)
+  ) {
+    return res
+      .status(400)
+      .send({ error: "A valid vendor id and item id are required." });
   }
 
   // Vendors may only mark items approved (available) or inactive (unavailable).
@@ -77,7 +97,9 @@ app.put("/update-menu-item/:id", async (req, res) => {
     return res.status(400).send({ error: "You cannot set that status." });
   }
 
-  const item = await menuCollection.findOne({ _id: new ObjectId(req.params.id) });
+  const item = await menuCollection.findOne({
+    _id: new ObjectId(req.params.id),
+  });
   if (!item) {
     return res.status(404).send({ error: "Menu item not found." });
   }
@@ -85,7 +107,15 @@ app.put("/update-menu-item/:id", async (req, res) => {
     return res.status(403).send({ error: "This item does not belong to you." });
   }
 
-  const allowed = ["itemName", "category", "description", "price", "location", "images", "status"];
+  const allowed = [
+    "itemName",
+    "category",
+    "description",
+    "price",
+    "location",
+    "images",
+    "status",
+  ];
   const changes = {};
   for (const key of allowed) {
     if (updates[key] !== undefined) changes[key] = updates[key];
@@ -93,7 +123,7 @@ app.put("/update-menu-item/:id", async (req, res) => {
 
   await menuCollection.updateOne(
     { _id: new ObjectId(req.params.id) },
-    { $set: changes }
+    { $set: changes },
   );
   res.send({ message: "Menu item updated." });
 });
@@ -102,11 +132,20 @@ app.put("/update-menu-item/:id", async (req, res) => {
 app.delete("/delete-menu-item/:id", async (req, res) => {
   const vendorId = req.query.vendorId;
 
-  if (typeof vendorId !== "string" || !vendorId || !ObjectId.isValid(vendorId) || !ObjectId.isValid(req.params.id)) {
-    return res.status(400).send({ error: "A valid vendor id and item id are required." });
+  if (
+    typeof vendorId !== "string" ||
+    !vendorId ||
+    !ObjectId.isValid(vendorId) ||
+    !ObjectId.isValid(req.params.id)
+  ) {
+    return res
+      .status(400)
+      .send({ error: "A valid vendor id and item id are required." });
   }
 
-  const item = await menuCollection.findOne({ _id: new ObjectId(req.params.id) });
+  const item = await menuCollection.findOne({
+    _id: new ObjectId(req.params.id),
+  });
   if (!item) {
     return res.status(404).send({ error: "Menu item not found." });
   }
