@@ -37,28 +37,53 @@ app.post("/add-menu", async (req, res) => {
   const result = await menuCollection.insertOne({
     ...data,
     vendorId: new ObjectId(vendorId),
+    // Temporary: there is no admin approval yet, so new items go live right away.
+    // Change this back to "pending" once the admin review flow exists.
+    status: "approved",
+    createdAt: new Date(),
   });
   res.send(result);
 });
 
 app.get("/menu", async (req, res) => {
-  const result = await menuCollection
-    .aggregate([
-      { $match: { status: "approved" } },
-      {
-        $lookup: {
-          from: "user",
-          localField: "vendorId",
-          foreignField: "_id",
-          as: "vendor",
-        },
-      },
-      { $unwind: { path: "$vendor", preserveNullAndEmptyArrays: true } },
-      { $sort: { createdAt: -1 } },
-    ])
-    .toArray();
+  const query = { status: "approved" };
+
+  if (typeof req.query.category === "string" && req.query.category) {
+    query.category = req.query.category;
+  }
+  if (typeof req.query.location === "string" && req.query.location) {
+    query.location = { $regex: req.query.location, $options: "i" };
+  }
+  if (typeof req.query.search === "string" && req.query.search) {
+    query.$or = [
+      { itemName: { $regex: req.query.search, $options: "i" } },
+      { description: { $regex: req.query.search, $options: "i" } },
+      { category: { $regex: req.query.search, $options: "i" } },
+      { location: { $regex: req.query.search, $options: "i" } },
+      { vendorName: { $regex: req.query.search, $options: "i" } },
+      { vendorBusinessName: { $regex: req.query.search, $options: "i" } },
+    ];
+  }
+
+  const sort =
+    req.query.sort === "price_asc"
+      ? { price: 1 }
+      : req.query.sort === "price_desc"
+        ? { price: -1 }
+        : { createdAt: -1 };
+
+  const result = await menuCollection.find(query).sort(sort).toArray();
   res.send(result);
 });
+
+// app.get("menuDetails/:id", async (req, res) => {
+//   const result = await menuCollection.findOneAndDelete({
+//     _id: new ObjectId(id),
+//     status: "approved",
+//   });
+//   res.send(result);
+// });
+
 app.get("/my-menu-items", async (req, res) => {
   const vendorId = req.query.vendorId;
   if (
