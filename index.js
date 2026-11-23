@@ -29,21 +29,58 @@ app.get("/", (req, res) => {
 });
 
 app.post("/add-menu", async (req, res) => {
-  const { vendorId, ...data } = req.body;
+  // Pick only the fields we expect. Spreading req.body would let a client
+  // inject anything (including status) into the saved document.
+  const {
+    vendorId,
+    vendorName,
+    vendorBusinessName,
+    itemName,
+    category,
+    description,
+    price,
+    location,
+    images,
+  } = req.body;
 
   if (!vendorId || !ObjectId.isValid(vendorId)) {
     return res.status(400).send({ error: "A valid vendor id is required." });
   }
+  if (!itemName || !category || !description || !location || !(price > 0)) {
+    return res.status(400).send({ error: "Please fill in all item fields." });
+  }
 
   const result = await menuCollection.insertOne({
-    ...data,
     vendorId: new ObjectId(vendorId),
+    vendorName: vendorName ?? "Local vendor",
+    vendorBusinessName: vendorBusinessName ?? null,
+    itemName,
+    category,
+    description,
+    price,
+    location,
+    images: Array.isArray(images) ? images : [],
     // Temporary: there is no admin approval yet, so new items go live right away.
     // Change this back to "pending" once the admin review flow exists.
     status: "approved",
     createdAt: new Date(),
   });
   res.send(result);
+});
+// How many ACTIVE items a vendor already has (used for the 3-item Free limit).
+app.post("/add-menu/count", async (req, res) => {
+  // Accept the id from the query string or the body, whichever the client sends.
+  const vendorId = req.query.vendorId ?? req.body?.vendorId;
+
+  if (typeof vendorId !== "string" || !ObjectId.isValid(vendorId)) {
+    return res.status(400).send({ error: "A valid vendorId is required." });
+  }
+
+  const result = await menuCollection.countDocuments({
+    vendorId: new ObjectId(vendorId),
+    status: "approved",
+  });
+  res.send({ count: result });
 });
 
 app.get("/menu", async (req, res) => {
@@ -229,7 +266,9 @@ app.post("/orders", async (req, res) => {
     if (existing) {
       return res
         .status(409)
-        .send({ error: "You already have an active order for this item and date." });
+        .send({
+          error: "You already have an active order for this item and date.",
+        });
     }
 
     const result = await orderCollection.insertOne(order);
@@ -269,15 +308,19 @@ app.put("/cancel-order/:id", async (req, res) => {
     return res.status(404).send({ error: "Order not found." });
   }
   if (order.customerId !== customerId) {
-    return res.status(403).send({ error: "This order does not belong to you." });
+    return res
+      .status(403)
+      .send({ error: "This order does not belong to you." });
   }
   if (order.status !== "pending") {
-    return res.status(400).send({ error: "Only pending orders can be cancelled." });
+    return res
+      .status(400)
+      .send({ error: "Only pending orders can be cancelled." });
   }
 
   await orderCollection.updateOne(
     { _id: new ObjectId(id) },
-    { $set: { status: "cancelled" } }
+    { $set: { status: "cancelled" } },
   );
   res.send({ message: "Order cancelled." });
 });
