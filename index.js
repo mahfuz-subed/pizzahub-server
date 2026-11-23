@@ -68,7 +68,7 @@ app.post("/add-menu", async (req, res) => {
   res.send(result);
 });
 // How many ACTIVE items a vendor already has (used for the 3-item Free limit).
-app.post("/add-menu/count", async (req, res) => {
+app.get("/add-menu/count", async (req, res) => {
   // Accept the id from the query string or the body, whichever the client sends.
   const vendorId = req.query.vendorId ?? req.body?.vendorId;
 
@@ -264,11 +264,9 @@ app.post("/orders", async (req, res) => {
       status: { $in: ["pending", "accepted"] },
     });
     if (existing) {
-      return res
-        .status(409)
-        .send({
-          error: "You already have an active order for this item and date.",
-        });
+      return res.status(409).send({
+        error: "You already have an active order for this item and date.",
+      });
     }
 
     const result = await orderCollection.insertOne(order);
