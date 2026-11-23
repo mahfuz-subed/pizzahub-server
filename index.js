@@ -22,6 +22,7 @@ export async function connectToMongoDB() {
 const mongoClient = await connectToMongoDB();
 const db = mongoClient.db("pizzahubDB");
 const menuCollection = db.collection("menu");
+const orderCollection = db.collection("orders");
 
 app.get("/", (req, res) => {
   res.send("Hello World!");
@@ -210,6 +211,75 @@ app.delete("/delete-menu-item/:id", async (req, res) => {
 
   await menuCollection.deleteOne({ _id: new ObjectId(req.params.id) });
   res.send({ message: "Menu item deleted." });
+});
+
+// order related apis
+app.post("/orders", async (req, res) => {
+  try {
+    const order = req.body;
+
+    // Stop a customer from ordering the same item twice for the same date
+    // while an earlier order is still active (pending or accepted).
+    const existing = await orderCollection.findOne({
+      customerId: order.customerId,
+      itemId: order.itemId,
+      deliveryDate: order.deliveryDate,
+      status: { $in: ["pending", "accepted"] },
+    });
+    if (existing) {
+      return res
+        .status(409)
+        .send({ error: "You already have an active order for this item and date." });
+    }
+
+    const result = await orderCollection.insertOne(order);
+    res.send(result);
+  } catch (error) {
+    // Always answer with JSON so the client shows a readable message
+    // instead of trying to parse an HTML error page.
+    res.status(500).send({ error: "Could not save your order." });
+  }
+});
+
+// Orders belonging to one customer, newest first.
+app.get("/my-orders", async (req, res) => {
+  const customerId = req.query.customerId;
+  if (typeof customerId !== "string" || !customerId) {
+    return res.status(400).send({ error: "A customerId is required." });
+  }
+
+  const result = await orderCollection
+    .find({ customerId })
+    .sort({ createdAt: -1 })
+    .toArray();
+  res.send(result);
+});
+
+// A customer can cancel only their own pending order.
+app.put("/cancel-order/:id", async (req, res) => {
+  const { customerId } = req.body ?? {};
+  const { id } = req.params;
+
+  if (!customerId || !ObjectId.isValid(id)) {
+    return res.status(400).send({ error: "Invalid order request." });
+  }
+
+  const order = await orderCollection.findOne({ _id: new ObjectId(id) });
+  if (!order) {
+    return res.status(404).send({ error: "Order not found." });
+  }
+  if (order.customerId !== customerId) {
+    return res.status(403).send({ error: "This order does not belong to you." });
+  }
+  if (order.status !== "pending") {
+    return res.status(400).send({ error: "Only pending orders can be cancelled." });
+  }
+
+  await orderCollection.updateOne(
+    { _id: new ObjectId(id) },
+    { $set: { status: "cancelled" } }
+  );
+  res.send({ message: "Order cancelled." });
 });
 
 app.listen(port, () => {
