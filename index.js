@@ -1,6 +1,9 @@
 import express from "express";
 import cors from "cors";
 import "dotenv/config";
+import Stripe from "stripe";
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const app = express();
 const port = 5000;
 
@@ -23,11 +26,25 @@ const mongoClient = await connectToMongoDB();
 const db = mongoClient.db("pizzahubDB");
 const menuCollection = db.collection("menu");
 const orderCollection = db.collection("orders");
+const paymentsCollection = db.collection("payments");
+// Better Auth stores users in the singular "user" collection.
+const usersCollection = db.collection("user");
 
 app.get("/", (req, res) => {
   res.send("Hello World!");
 });
 
+// //users related apis
+// app.get("users/:id/premium", async (req, res) => {
+//   const id = req.params.id;
+//   const result = await usersCollection.findOne(
+//     { _id: new ObjectId(id) },
+//     { projection: { premium: 1 } },
+//   );
+//   res.send(result);
+// });
+
+//menu related apis
 app.post("/add-menu", async (req, res) => {
   // Pick only the fields we expect. Spreading req.body would let a client
   // inject anything (including status) into the saved document.
@@ -321,6 +338,71 @@ app.put("/cancel-order/:id", async (req, res) => {
     { $set: { status: "cancelled" } },
   );
   res.send({ message: "Order cancelled." });
+});
+
+//payments related apis
+app.post("/payments/checkout-verify", async (req, res) => {
+  const { sessionId } = req.body;
+
+  // No session id -> fail early with JSON.
+  if (typeof sessionId !== "string" || !sessionId) {
+    return res
+      .status(400)
+      .send({ success: false, message: "A sessionId is required." });
+  }
+
+  try {
+    const {
+      status,
+      payment_status,
+      customer_details,
+      metadata,
+      payment_intent,
+    } = await stripe.checkout.sessions.retrieve(sessionId);
+
+    // userId lives inside metadata, and may be missing -> guard it.
+    const userId = metadata?.userId;
+
+    if (status === "complete" && payment_status === "paid") {
+      const sessionQuery = { sessionId };
+      const existingPayment = await paymentsCollection.findOne(sessionQuery);
+      if (existingPayment) {
+        return res.send({
+          success: false,
+          message: "Payment already verified",
+        });
+      }
+      const payment = {
+        status,
+        payment_status,
+        customer_details,
+        userId,
+        payment_date: new Date(),
+        payment_intent,
+      };
+      const result = await paymentsCollection.insertOne(payment);
+
+      // updateOne needs TWO arguments: a filter and an update document.
+      // Activate Premium using the field the rest of the app reads.
+      const updatedResult = await usersCollection.updateOne(
+        { _id: new ObjectId(userId) },
+        { $set: { subscriptionPlan: "premium" } },
+      );
+
+      // return -> stop here so the fallback below does not also run.
+      return res.send({ success: true, result, updatedResult });
+    }
+
+    // Session exists but is not paid/complete: answer instead of hanging.
+    return res.send({
+      success: false,
+      message: "Payment verification failed.",
+    });
+  } catch (error) {
+    return res
+      .status(500)
+      .send({ success: false, message: "Could not verify the payment." });
+  }
 });
 
 app.listen(port, () => {
