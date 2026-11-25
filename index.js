@@ -34,15 +34,15 @@ app.get("/", (req, res) => {
   res.send("Hello World!");
 });
 
-// //users related apis
-// app.get("users/:id/premium", async (req, res) => {
-//   const id = req.params.id;
-//   const result = await usersCollection.findOne(
-//     { _id: new ObjectId(id) },
-//     { projection: { premium: 1 } },
-//   );
-//   res.send(result);
-// });
+//users related apis
+app.get("users/:id/premium", async (req, res) => {
+  const id = req.params.id;
+  const result = await usersCollection.findOne(
+    { _id: new ObjectId(id) },
+    { projection: { premium: 1 } },
+  );
+  res.send(result);
+});
 
 //menu related apis
 app.post("/add-menu", async (req, res) => {
