@@ -35,11 +35,11 @@ app.get("/", (req, res) => {
 });
 
 //users related apis
-app.get("users/:id/premium", async (req, res) => {
+app.get("/users/:id/premium", async (req, res) => {
   const id = req.params.id;
   const result = await usersCollection.findOne(
     { _id: new ObjectId(id) },
-    { projection: { premium: 1 } },
+    { projection: { subscriptionPlan: 1 } },
   );
   res.send(result);
 });
