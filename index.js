@@ -30,6 +30,15 @@ const paymentsCollection = db.collection("payments");
 // Better Auth stores users in the singular "user" collection.
 const usersCollection = db.collection("user");
 
+// Must be used AFTER a token-checking middleware sets req.user.
+// Stays a 403 by default while that middleware does not exist yet.
+const verifyAdmin = (req, res, next) => {
+  if (req.user?.role !== "admin") {
+    return res.status(403).send({ message: "Forbidden" });
+  }
+  next();
+};
+
 app.get("/", (req, res) => {
   res.send("Hello World!");
 });
@@ -447,6 +456,131 @@ app.post("/payments/checkout-verify", async (req, res) => {
       .status(500)
       .send({ success: false, message: "Could not verify the payment." });
   }
+});
+
+// Admin APIs - every one is guarded by verifyAdmin.
+// Until verifyToken is added, verifyAdmin returns 403 for all requests.
+
+// Overview numbers for the admin dashboard.
+app.get("/admin/overview", verifyAdmin, async (req, res) => {
+  const [users, vendors, customers, menuItems, pending, transactions] =
+    await Promise.all([
+      usersCollection.countDocuments({}),
+      usersCollection.countDocuments({ role: "vendor" }),
+      usersCollection.countDocuments({ role: "customer" }),
+      menuCollection.countDocuments({}),
+      menuCollection.countDocuments({ status: "pending" }),
+      paymentsCollection.countDocuments({}),
+    ]);
+
+  res.send({
+    users,
+    vendors,
+    customers,
+    menuItems,
+    pending,
+    transactions,
+  });
+});
+
+// Manage users: optional ?search= and ?role= filters.
+app.get("/users", verifyAdmin, async (req, res) => {
+  const query = {};
+  if (typeof req.query.search === "string" && req.query.search) {
+    query.$or = [
+      { name: { $regex: req.query.search, $options: "i" } },
+      { email: { $regex: req.query.search, $options: "i" } },
+    ];
+  }
+  if (typeof req.query.role === "string" && req.query.role) {
+    query.role = req.query.role;
+  }
+
+  const result = await usersCollection.find(query).toArray();
+  res.send(result);
+});
+
+// Change a user's role. Admin role cannot be assigned here.
+app.patch("/users/:id/role", verifyAdmin, async (req, res) => {
+  const { role } = req.body;
+  if (!["vendor", "customer"].includes(role)) {
+    return res.status(400).send({ error: "Invalid role." });
+  }
+  if (!ObjectId.isValid(req.params.id)) {
+    return res.status(400).send({ error: "Invalid user id." });
+  }
+
+  const result = await usersCollection.updateOne(
+    { _id: new ObjectId(req.params.id) },
+    { $set: { role } },
+  );
+  res.send(result);
+});
+
+//block / unblock a user.
+app.patch("/users/:id/block", verifyAdmin, async (req, res) => {
+  const { isBlocked } = req.body;
+  if (typeof isBlocked !== "boolean" || !ObjectId.isValid(req.params.id)) {
+    return res.status(400).send({ error: "Invalid request." });
+  }
+
+  const result = await usersCollection.updateOne(
+    { _id: new ObjectId(req.params.id) },
+    { $set: { isBlocked } },
+  );
+  res.send(result);
+});
+
+// Manage menu items:  ?search=, ?status= and ?category= filters.
+app.get("/admin/menu-items", verifyAdmin, async (req, res) => {
+  const query = {};
+  if (typeof req.query.status === "string" && req.query.status) {
+    query.status = req.query.status;
+  }
+  if (typeof req.query.category === "string" && req.query.category) {
+    query.category = req.query.category;
+  }
+  if (typeof req.query.search === "string" && req.query.search) {
+    query.itemName = { $regex: req.query.search, $options: "i" };
+  }
+
+  const result = await menuCollection.find(query).toArray();
+  res.send(result);
+});
+
+// Approve / reject / change availability of a published item.
+app.patch("/admin/menu-items/:id/status", verifyAdmin, async (req, res) => {
+  const { status } = req.body;
+  if (!["approved", "rejected", "inactive"].includes(status)) {
+    return res.status(400).send({ error: "Invalid status." });
+  }
+  if (!ObjectId.isValid(req.params.id)) {
+    return res.status(400).send({ error: "Invalid item id." });
+  }
+
+  const result = await menuCollection.updateOne(
+    { _id: new ObjectId(req.params.id) },
+    { $set: { status } },
+  );
+  res.send(result);
+});
+
+// Delete an inappropriate item.
+app.delete("/admin/menu-items/:id", verifyAdmin, async (req, res) => {
+  if (!ObjectId.isValid(req.params.id)) {
+    return res.status(400).send({ error: "Invalid item id." });
+  }
+
+  const result = await menuCollection.deleteOne({
+    _id: new ObjectId(req.params.id),
+  });
+  res.send(result);
+});
+
+// Transactions - read only, admins cannot edit payment records.
+app.get("/admin/transactions", verifyAdmin, async (req, res) => {
+  const result = await paymentsCollection.find().toArray();
+  res.send(result);
 });
 
 app.listen(port, () => {
