@@ -267,6 +267,20 @@ app.delete("/delete-menu-item/:id", async (req, res) => {
   res.send({ message: "Menu item deleted." });
 });
 
+// Orders received by one vendor, newest first.
+app.get("/vendor-orders", async (req, res) => {
+  const vendorId = req.query.vendorId;
+  if (typeof vendorId !== "string" || !ObjectId.isValid(vendorId)) {
+    return res.status(400).send({ error: "A valid vendorId is required." });
+  }
+
+  const result = await orderCollection
+    .find({ vendorId })
+    .sort({ createdAt: -1 })
+    .toArray();
+  res.send(result);
+});
+
 // order related apis
 app.post("/orders", async (req, res) => {
   try {
