@@ -281,6 +281,36 @@ app.get("/vendor-orders", async (req, res) => {
   res.send(result);
 });
 
+app.patch("/update-order-status/:id", async (req, res) => {
+  const { vendorId, status } = req.body;
+
+  if (!vendorId || !ObjectId.isValid(req.params.id)) {
+    return res.status(400).send({ error: "Invalid order request." });
+  }
+  if (!["accepted", "rejected"].includes(status)) {
+    return res.status(400).send({ error: "You cannot set that status." });
+  }
+
+  // This only matches an order that is THIS vendor's AND still pending
+  const query = {
+    _id: new ObjectId(req.params.id),
+    vendorId: vendorId,
+    status: "pending",
+  };
+  const result = await orderCollection.updateOne(query, {
+    $set: { status: status },
+  });
+
+  // matchedCount = how many orders matched the whole query
+  if (result.matchedCount === 0) {
+    return res.status(409).send({
+      error:
+        "This order cannot be updated. It belongs to another vendor, or it was already decided.",
+    });
+  }
+  res.send({ message: `Order ${status}.` });
+});
+
 // order related apis
 app.post("/orders", async (req, res) => {
   try {
