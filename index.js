@@ -11,6 +11,7 @@ app.use(cors());
 app.use(express.json());
 
 import { MongoClient, ObjectId } from "mongodb";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 const client = new MongoClient(process.env.MONGODB_URI);
 export async function connectToMongoDB() {
   try {
@@ -30,10 +31,59 @@ const paymentsCollection = db.collection("payments");
 // Better Auth stores users in the singular "user" collection.
 const usersCollection = db.collection("user");
 
-// Must be used AFTER a token-checking middleware sets req.user.
-// Stays a 403 by default while that middleware does not exist yet.
+// Verifies the JWT that Better Auth mints, using its public keys (JWKS).
+// On success it attaches the matching user to req.user.
+const JWKS = createRemoteJWKSet(
+  new URL(`${process.env.CLIENT_URL}/api/auth/jwks`)
+);
+
+const verifyToken = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) {
+    return res.status(401).send({ message: "Unauthorized" });
+  }
+
+  const token = authHeader.split(" ")[1];
+  if (!token) {
+    return res.status(401).send({ message: "Unauthorized" });
+  }
+
+  try {
+    const { payload } = await jwtVerify(token, JWKS);
+
+    // payload.sub is the user id Better Auth put inside the token.
+    const user = await usersCollection.findOne({
+      _id: new ObjectId(payload.sub),
+    });
+    if (!user || user.isBlocked) {
+      return res.status(401).send({ message: "Unauthorized" });
+    }
+
+    req.user = user;
+    next();
+  } catch {
+    return res.status(401).send({ message: "Unauthorized" });
+  }
+};
+
+// Must be used AFTER verifyToken, which sets req.user.
 const verifyAdmin = (req, res, next) => {
   if (req.user?.role !== "admin") {
+    return res.status(403).send({ message: "Forbidden" });
+  }
+  next();
+};
+
+// Same pattern for the other two roles.
+const verifyVendor = (req, res, next) => {
+  if (req.user?.role !== "vendor") {
+    return res.status(403).send({ message: "Forbidden" });
+  }
+  next();
+};
+
+const verifyCustomer = (req, res, next) => {
+  if (req.user?.role !== "customer") {
     return res.status(403).send({ message: "Forbidden" });
   }
   next();
@@ -54,11 +104,10 @@ app.get("/users/:id/premium", async (req, res) => {
 });
 
 //menu related apis
-app.post("/add-menu", async (req, res) => {
+app.post("/add-menu", verifyToken, verifyVendor, async (req, res) => {
   // Pick only the fields we expect. Spreading req.body would let a client
   // inject anything (including status) into the saved document.
   const {
-    vendorId,
     vendorName,
     vendorBusinessName,
     itemName,
@@ -69,15 +118,13 @@ app.post("/add-menu", async (req, res) => {
     images,
   } = req.body;
 
-  if (!vendorId || !ObjectId.isValid(vendorId)) {
-    return res.status(400).send({ error: "A valid vendor id is required." });
-  }
   if (!itemName || !category || !description || !location || !(price > 0)) {
     return res.status(400).send({ error: "Please fill in all item fields." });
   }
 
   const result = await menuCollection.insertOne({
-    vendorId: new ObjectId(vendorId),
+    // Ownership comes from the verified token, never from the request body.
+    vendorId: req.user._id,
     vendorName: vendorName ?? "Local vendor",
     vendorBusinessName: vendorBusinessName ?? null,
     itemName,
@@ -94,16 +141,10 @@ app.post("/add-menu", async (req, res) => {
   res.send(result);
 });
 // How many ACTIVE items a vendor already has (used for the 3-item Free limit).
-app.get("/add-menu/count", async (req, res) => {
-  // Accept the id from the query string or the body, whichever the client sends.
-  const vendorId = req.query.vendorId ?? req.body?.vendorId;
-
-  if (typeof vendorId !== "string" || !ObjectId.isValid(vendorId)) {
-    return res.status(400).send({ error: "A valid vendorId is required." });
-  }
-
+app.get("/add-menu/count", verifyToken, verifyVendor, async (req, res) => {
+  // The vendor is the verified user - no id is trusted from the URL.
   const result = await menuCollection.countDocuments({
-    vendorId: new ObjectId(vendorId),
+    vendorId: req.user._id,
     status: "approved",
   });
   res.send({ count: result });
@@ -161,18 +202,9 @@ app.get("/menuDetails/:id", async (req, res) => {
   res.send(item);
 });
 
-app.get("/my-menu-items", async (req, res) => {
-  const vendorId = req.query.vendorId;
-  if (
-    typeof vendorId !== "string" ||
-    !vendorId ||
-    !ObjectId.isValid(vendorId)
-  ) {
-    return res.status(400).json({ error: "A valid vendorId is required." });
-  }
-
+app.get("/my-menu-items", verifyToken, verifyVendor, async (req, res) => {
   const result = await menuCollection
-    .find({ vendorId: new ObjectId(vendorId) })
+    .find({ vendorId: req.user._id })
     .sort({ createdAt: -1 }) // newest first
     .toArray();
 
@@ -197,7 +229,7 @@ app.get("/menu/categories", async (req, res) => {
 });
 
 // Update a menu item (also used to toggle availability via "status")
-app.put("/update-menu-item/:id", async (req, res) => {
+app.put("/update-menu-item/:id", verifyToken, verifyVendor, async (req, res) => {
   const { vendorId, ...updates } = req.body;
 
   if (
@@ -248,7 +280,7 @@ app.put("/update-menu-item/:id", async (req, res) => {
 });
 
 // Delete a menu item
-app.delete("/delete-menu-item/:id", async (req, res) => {
+app.delete("/delete-menu-item/:id", verifyToken, verifyVendor, async (req, res) => {
   const vendorId = req.query.vendorId;
 
   if (
@@ -277,33 +309,29 @@ app.delete("/delete-menu-item/:id", async (req, res) => {
 });
 
 // Orders received by one vendor, newest first.
-app.get("/vendor-orders", async (req, res) => {
-  const vendorId = req.query.vendorId;
-  if (typeof vendorId !== "string" || !ObjectId.isValid(vendorId)) {
-    return res.status(400).send({ error: "A valid vendorId is required." });
-  }
-
+app.get("/vendor-orders", verifyToken, verifyVendor, async (req, res) => {
   const result = await orderCollection
-    .find({ vendorId })
+    .find({ vendorId: req.user._id })
     .sort({ createdAt: -1 })
     .toArray();
   res.send(result);
 });
 
-app.patch("/update-order-status/:id", async (req, res) => {
-  const { vendorId, status } = req.body;
+app.patch("/update-order-status/:id", verifyToken, verifyVendor, async (req, res) => {
+  const { status } = req.body;
 
-  if (!vendorId || !ObjectId.isValid(req.params.id)) {
+  if (!ObjectId.isValid(req.params.id)) {
     return res.status(400).send({ error: "Invalid order request." });
   }
   if (!["accepted", "rejected"].includes(status)) {
     return res.status(400).send({ error: "You cannot set that status." });
   }
 
-  // This only matches an order that is THIS vendor's AND still pending
+  // This only matches an order that is THIS vendor's AND still pending.
+  // vendorId comes from the token, not the request body.
   const query = {
     _id: new ObjectId(req.params.id),
-    vendorId: vendorId,
+    vendorId: req.user._id,
     status: "pending",
   };
   const result = await orderCollection.updateOne(query, {
@@ -321,9 +349,10 @@ app.patch("/update-order-status/:id", async (req, res) => {
 });
 
 // order related apis
-app.post("/orders", async (req, res) => {
+app.post("/orders", verifyToken, verifyCustomer, async (req, res) => {
   try {
-    const order = req.body;
+    // customerId comes from the token, never from the request body.
+    const order = { ...req.body, customerId: req.user._id };
 
     // Stop a customer from ordering the same item twice for the same date
     // while an earlier order is still active (pending or accepted).
@@ -349,25 +378,19 @@ app.post("/orders", async (req, res) => {
 });
 
 // Orders belonging to one customer, newest first.
-app.get("/my-orders", async (req, res) => {
-  const customerId = req.query.customerId;
-  if (typeof customerId !== "string" || !customerId) {
-    return res.status(400).send({ error: "A customerId is required." });
-  }
-
+app.get("/my-orders", verifyToken, verifyCustomer, async (req, res) => {
   const result = await orderCollection
-    .find({ customerId })
+    .find({ customerId: req.user._id })
     .sort({ createdAt: -1 })
     .toArray();
   res.send(result);
 });
 
 // A customer can cancel only their own pending order.
-app.put("/cancel-order/:id", async (req, res) => {
-  const { customerId } = req.body ?? {};
+app.put("/cancel-order/:id", verifyToken, verifyCustomer, async (req, res) => {
   const { id } = req.params;
 
-  if (!customerId || !ObjectId.isValid(id)) {
+  if (!ObjectId.isValid(id)) {
     return res.status(400).send({ error: "Invalid order request." });
   }
 
@@ -375,7 +398,8 @@ app.put("/cancel-order/:id", async (req, res) => {
   if (!order) {
     return res.status(404).send({ error: "Order not found." });
   }
-  if (order.customerId !== customerId) {
+  // Ownership comes from the verified token.
+  if (order.customerId !== String(req.user._id)) {
     return res
       .status(403)
       .send({ error: "This order does not belong to you." });
@@ -394,7 +418,7 @@ app.put("/cancel-order/:id", async (req, res) => {
 });
 
 //payments related apis
-app.post("/payments/checkout-verify", async (req, res) => {
+app.post("/payments/checkout-verify", verifyToken, async (req, res) => {
   const { sessionId } = req.body;
 
   // No session id -> fail early with JSON.
@@ -458,11 +482,10 @@ app.post("/payments/checkout-verify", async (req, res) => {
   }
 });
 
-// Admin APIs - every one is guarded by verifyAdmin.
-// Until verifyToken is added, verifyAdmin returns 403 for all requests.
+// Admin APIs - every one checks the JWT first, then the admin role.
 
 // Overview numbers for the admin dashboard.
-app.get("/admin/overview", verifyAdmin, async (req, res) => {
+app.get("/admin/overview", verifyToken, verifyAdmin, async (req, res) => {
   const [users, vendors, customers, menuItems, pending, transactions] =
     await Promise.all([
       usersCollection.countDocuments({}),
@@ -484,7 +507,7 @@ app.get("/admin/overview", verifyAdmin, async (req, res) => {
 });
 
 // Manage users: optional ?search= and ?role= filters.
-app.get("/users", verifyAdmin, async (req, res) => {
+app.get("/users", verifyToken, verifyAdmin, async (req, res) => {
   const query = {};
   if (typeof req.query.search === "string" && req.query.search) {
     query.$or = [
@@ -501,7 +524,7 @@ app.get("/users", verifyAdmin, async (req, res) => {
 });
 
 // Change a user's role. Admin role cannot be assigned here.
-app.patch("/users/:id/role", verifyAdmin, async (req, res) => {
+app.patch("/users/:id/role", verifyToken, verifyAdmin, async (req, res) => {
   const { role } = req.body;
   if (!["vendor", "customer"].includes(role)) {
     return res.status(400).send({ error: "Invalid role." });
@@ -518,7 +541,7 @@ app.patch("/users/:id/role", verifyAdmin, async (req, res) => {
 });
 
 //block / unblock a user.
-app.patch("/users/:id/block", verifyAdmin, async (req, res) => {
+app.patch("/users/:id/block", verifyToken, verifyAdmin, async (req, res) => {
   const { isBlocked } = req.body;
   if (typeof isBlocked !== "boolean" || !ObjectId.isValid(req.params.id)) {
     return res.status(400).send({ error: "Invalid request." });
@@ -532,7 +555,7 @@ app.patch("/users/:id/block", verifyAdmin, async (req, res) => {
 });
 
 // Manage menu items:  ?search=, ?status= and ?category= filters.
-app.get("/admin/menu-items", verifyAdmin, async (req, res) => {
+app.get("/admin/menu-items", verifyToken, verifyAdmin, async (req, res) => {
   const query = {};
   if (typeof req.query.status === "string" && req.query.status) {
     query.status = req.query.status;
@@ -549,7 +572,7 @@ app.get("/admin/menu-items", verifyAdmin, async (req, res) => {
 });
 
 // Approve / reject / change availability of a published item.
-app.patch("/admin/menu-items/:id/status", verifyAdmin, async (req, res) => {
+app.patch("/admin/menu-items/:id/status", verifyToken, verifyAdmin, async (req, res) => {
   const { status } = req.body;
   if (!["approved", "rejected", "inactive"].includes(status)) {
     return res.status(400).send({ error: "Invalid status." });
@@ -566,7 +589,7 @@ app.patch("/admin/menu-items/:id/status", verifyAdmin, async (req, res) => {
 });
 
 // Delete an inappropriate item.
-app.delete("/admin/menu-items/:id", verifyAdmin, async (req, res) => {
+app.delete("/admin/menu-items/:id", verifyToken, verifyAdmin, async (req, res) => {
   if (!ObjectId.isValid(req.params.id)) {
     return res.status(400).send({ error: "Invalid item id." });
   }
@@ -578,7 +601,7 @@ app.delete("/admin/menu-items/:id", verifyAdmin, async (req, res) => {
 });
 
 // Transactions - read only, admins cannot edit payment records.
-app.get("/admin/transactions", verifyAdmin, async (req, res) => {
+app.get("/admin/transactions", verifyToken, verifyAdmin, async (req, res) => {
   const result = await paymentsCollection.find().toArray();
   res.send(result);
 });
