@@ -27,14 +27,13 @@ const mongoClient = await connectToMongoDB();
 const db = mongoClient.db("pizzahubDB");
 const menuCollection = db.collection("menu");
 const orderCollection = db.collection("orders");
-const paymentsCollection = db.collection("payments");
-// Better Auth stores users in the singular "user" collection.
+
+const transactionsCollection = db.collection("transactions");
+
 const usersCollection = db.collection("user");
 
-// Verifies the JWT that Better Auth mints, using its public keys (JWKS).
-// On success it attaches the matching user to req.user.
 const JWKS = createRemoteJWKSet(
-  new URL(`${process.env.CLIENT_URL}/api/auth/jwks`)
+  new URL(`${process.env.CLIENT_URL}/api/auth/jwks`),
 );
 
 const verifyToken = async (req, res, next) => {
@@ -89,7 +88,7 @@ const verifyVendor = async (req, res, next) => {
   ) {
     await usersCollection.updateOne(
       { _id: req.user._id },
-      { $set: { subscriptionPlan: "free" } }
+      { $set: { subscriptionPlan: "free" } },
     );
     req.user.subscriptionPlan = "free";
   }
@@ -122,10 +121,7 @@ app.get("/users/:id/premium", async (req, res) => {
 // and to put their items first in the featured section.
 app.get("/premium-vendors", async (req, res) => {
   const result = await usersCollection
-    .find(
-      { subscriptionPlan: "premium" },
-      { projection: { _id: 1 } }
-    )
+    .find({ subscriptionPlan: "premium" }, { projection: { _id: 1 } })
     .toArray();
   res.send(result.map((user) => String(user._id)));
 });
@@ -160,9 +156,8 @@ app.post("/add-menu", verifyToken, verifyVendor, async (req, res) => {
     price,
     location,
     images: Array.isArray(images) ? images : [],
-    // Temporary: there is no admin approval yet, so new items go live right away.
-    // Change this back to "pending" once the admin review flow exists.
-    status: "approved",
+    // New items wait for admin approval before they appear publicly.
+    status: "pending",
     createdAt: new Date(),
   });
   res.send(result);
@@ -258,130 +253,146 @@ app.get("/menu/categories", async (req, res) => {
 });
 
 // Update a menu item (also used to toggle availability via "status")
-app.put("/update-menu-item/:id", verifyToken, verifyVendor, async (req, res) => {
-  const { vendorId, ...updates } = req.body;
+app.put(
+  "/update-menu-item/:id",
+  verifyToken,
+  verifyVendor,
+  async (req, res) => {
+    const { vendorId, ...updates } = req.body;
 
-  if (
-    !vendorId ||
-    !ObjectId.isValid(vendorId) ||
-    !ObjectId.isValid(req.params.id)
-  ) {
-    return res
-      .status(400)
-      .send({ error: "A valid vendor id and item id are required." });
-  }
+    if (
+      !vendorId ||
+      !ObjectId.isValid(vendorId) ||
+      !ObjectId.isValid(req.params.id)
+    ) {
+      return res
+        .status(400)
+        .send({ error: "A valid vendor id and item id are required." });
+    }
 
-  // Vendors may only mark items approved (available) or inactive (unavailable).
-  // They cannot approve a pending item or change it to rejected.
-  if (updates.status && !["approved", "inactive"].includes(updates.status)) {
-    return res.status(400).send({ error: "You cannot set that status." });
-  }
+    // Vendors may only mark items approved (available) or inactive (unavailable).
+    // They cannot approve a pending item or change it to rejected.
+    if (updates.status && !["approved", "inactive"].includes(updates.status)) {
+      return res.status(400).send({ error: "You cannot set that status." });
+    }
 
-  const item = await menuCollection.findOne({
-    _id: new ObjectId(req.params.id),
-  });
-  if (!item) {
-    return res.status(404).send({ error: "Menu item not found." });
-  }
-  if (String(item.vendorId) !== vendorId) {
-    return res.status(403).send({ error: "This item does not belong to you." });
-  }
+    const item = await menuCollection.findOne({
+      _id: new ObjectId(req.params.id),
+    });
+    if (!item) {
+      return res.status(404).send({ error: "Menu item not found." });
+    }
+    if (String(item.vendorId) !== vendorId) {
+      return res
+        .status(403)
+        .send({ error: "This item does not belong to you." });
+    }
 
-  const allowed = [
-    "itemName",
-    "category",
-    "description",
-    "price",
-    "location",
-    "images",
-    "status",
-  ];
-  const changes = {};
-  for (const key of allowed) {
-    if (updates[key] !== undefined) changes[key] = updates[key];
-  }
+    const allowed = [
+      "itemName",
+      "category",
+      "description",
+      "price",
+      "location",
+      "images",
+      "status",
+    ];
+    const changes = {};
+    for (const key of allowed) {
+      if (updates[key] !== undefined) changes[key] = updates[key];
+    }
 
-  await menuCollection.updateOne(
-    { _id: new ObjectId(req.params.id) },
-    { $set: changes },
-  );
-  res.send({ message: "Menu item updated." });
-});
+    await menuCollection.updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: changes },
+    );
+    res.send({ message: "Menu item updated." });
+  },
+);
 
 // Delete a menu item
-app.delete("/delete-menu-item/:id", verifyToken, verifyVendor, async (req, res) => {
-  const vendorId = req.query.vendorId;
+app.delete(
+  "/delete-menu-item/:id",
+  verifyToken,
+  verifyVendor,
+  async (req, res) => {
+    const vendorId = req.query.vendorId;
 
-  if (
-    typeof vendorId !== "string" ||
-    !vendorId ||
-    !ObjectId.isValid(vendorId) ||
-    !ObjectId.isValid(req.params.id)
-  ) {
-    return res
-      .status(400)
-      .send({ error: "A valid vendor id and item id are required." });
-  }
+    if (
+      typeof vendorId !== "string" ||
+      !vendorId ||
+      !ObjectId.isValid(vendorId) ||
+      !ObjectId.isValid(req.params.id)
+    ) {
+      return res
+        .status(400)
+        .send({ error: "A valid vendor id and item id are required." });
+    }
 
-  const item = await menuCollection.findOne({
-    _id: new ObjectId(req.params.id),
-  });
-  if (!item) {
-    return res.status(404).send({ error: "Menu item not found." });
-  }
-  if (String(item.vendorId) !== vendorId) {
-    return res.status(403).send({ error: "This item does not belong to you." });
-  }
+    const item = await menuCollection.findOne({
+      _id: new ObjectId(req.params.id),
+    });
+    if (!item) {
+      return res.status(404).send({ error: "Menu item not found." });
+    }
+    if (String(item.vendorId) !== vendorId) {
+      return res
+        .status(403)
+        .send({ error: "This item does not belong to you." });
+    }
 
-  await menuCollection.deleteOne({ _id: new ObjectId(req.params.id) });
-  res.send({ message: "Menu item deleted." });
-});
+    await menuCollection.deleteOne({ _id: new ObjectId(req.params.id) });
+    res.send({ message: "Menu item deleted." });
+  },
+);
 
 // Orders received by one vendor, newest first.
 app.get("/vendor-orders", verifyToken, verifyVendor, async (req, res) => {
   // Stored vendorId is a string (older orders) or ObjectId (new ones).
   const result = await orderCollection
     .find({
-      $or: [
-        { vendorId: String(req.user._id) },
-        { vendorId: req.user._id },
-      ],
+      $or: [{ vendorId: String(req.user._id) }, { vendorId: req.user._id }],
     })
     .sort({ createdAt: -1 })
     .toArray();
   res.send(result);
 });
 
-app.patch("/update-order-status/:id", verifyToken, verifyVendor, async (req, res) => {
-  const { status } = req.body;
+app.patch(
+  "/update-order-status/:id",
+  verifyToken,
+  verifyVendor,
+  async (req, res) => {
+    const { status } = req.body;
 
-  if (!ObjectId.isValid(req.params.id)) {
-    return res.status(400).send({ error: "Invalid order request." });
-  }
-  if (!["accepted", "rejected"].includes(status)) {
-    return res.status(400).send({ error: "You cannot set that status." });
-  }
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).send({ error: "Invalid order request." });
+    }
+    if (!["accepted", "rejected"].includes(status)) {
+      return res.status(400).send({ error: "You cannot set that status." });
+    }
 
-  // This only matches an order that is THIS vendor's AND still pending.
-  // vendorId comes from the token, not the request body.
-  const query = {
-    _id: new ObjectId(req.params.id),
-    $or: [{ vendorId: String(req.user._id) }, { vendorId: req.user._id }],
-    status: "pending",
-  };
-  const result = await orderCollection.updateOne(query, {
-    $set: { status: status },
-  });
-
-  // matchedCount = how many orders matched the whole query
-  if (result.matchedCount === 0) {
-    return res.status(409).send({
-      error:
-        "This order cannot be updated. It belongs to another vendor, or it was already decided.",
+    // This only matches an order that is THIS vendor's AND still pending.
+    // vendorId comes from the token, not the request body.
+    const query = {
+      _id: new ObjectId(req.params.id),
+      $or: [{ vendorId: String(req.user._id) }, { vendorId: req.user._id }],
+      status: "pending",
+    };
+    const result = await orderCollection.updateOne(query, {
+      $set: { status: status },
     });
-  }
-  res.send({ message: `Order ${status}.` });
-});
+
+    // matchedCount = how many orders matched the whole query
+    if (result.matchedCount === 0) {
+      return res.status(409).send({
+        error:
+          "This order cannot be updated. It belongs to another vendor, or it was already decided.",
+      });
+    }
+    res.send({ message: `Order ${status}.` });
+  },
+);
 
 // order related apis
 app.post("/orders", verifyToken, verifyCustomer, async (req, res) => {
@@ -417,10 +428,7 @@ app.get("/my-orders", verifyToken, verifyCustomer, async (req, res) => {
   // customerId is a string in seeded orders and an ObjectId in newer ones.
   const result = await orderCollection
     .find({
-      $or: [
-        { customerId: String(req.user._id) },
-        { customerId: req.user._id },
-      ],
+      $or: [{ customerId: String(req.user._id) }, { customerId: req.user._id }],
     })
     .sort({ createdAt: -1 })
     .toArray();
@@ -493,29 +501,42 @@ app.post("/payments/checkout-verify", verifyToken, async (req, res) => {
     }
 
     if (status === "complete" && payment_status === "paid") {
-      const sessionQuery = { sessionId };
-      const existingPayment = await paymentsCollection.findOne(sessionQuery);
-      if (existingPayment) {
+      // Idempotency: one transaction per Stripe session.
+      const existing = await transactionsCollection.findOne({
+        stripeSessionId: sessionId,
+      });
+      if (existing) {
         return res.send({
           success: false,
           message: "Payment already verified",
         });
       }
-      const payment = {
-        status,
-        payment_status,
-        customer_details,
-        userId,
-        payment_date: new Date(),
-        payment_intent,
+
+      const transaction = {
+        vendorId: String(userId),
+        plan: "premium",
+        amount: session.amount_total ?? null,
+        currency: session.currency ?? null,
+        stripeSessionId: sessionId,
+        stripeSubscriptionId:
+          typeof subscription === "string"
+            ? subscription
+            : (subscription?.id ?? null),
+        status: payment_status,
+        createdAt: new Date(),
       };
-      const result = await paymentsCollection.insertOne(payment);
+      const result = await transactionsCollection.insertOne(transaction);
 
       // updateOne needs TWO arguments: a filter and an update document.
       // Activate Premium using the field the rest of the app reads.
       const updatedResult = await usersCollection.updateOne(
         { _id: new ObjectId(userId) },
-        { $set: { subscriptionPlan: "premium", subscriptionExpiresAt: expiresAt } },
+        {
+          $set: {
+            subscriptionPlan: "premium",
+            subscriptionExpiresAt: expiresAt,
+          },
+        },
       );
 
       // return -> stop here so the fallback below does not also run.
@@ -545,7 +566,7 @@ app.get("/admin/overview", verifyToken, verifyAdmin, async (req, res) => {
       usersCollection.countDocuments({ role: "customer" }),
       menuCollection.countDocuments({}),
       menuCollection.countDocuments({ status: "pending" }),
-      paymentsCollection.countDocuments({}),
+      transactionsCollection.countDocuments({}),
     ]);
 
   res.send({
@@ -624,37 +645,47 @@ app.get("/admin/menu-items", verifyToken, verifyAdmin, async (req, res) => {
 });
 
 // Approve / reject / change availability of a published item.
-app.patch("/admin/menu-items/:id/status", verifyToken, verifyAdmin, async (req, res) => {
-  const { status } = req.body;
-  if (!["approved", "rejected", "inactive"].includes(status)) {
-    return res.status(400).send({ error: "Invalid status." });
-  }
-  if (!ObjectId.isValid(req.params.id)) {
-    return res.status(400).send({ error: "Invalid item id." });
-  }
+app.patch(
+  "/admin/menu-items/:id/status",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    const { status } = req.body;
+    if (!["approved", "rejected", "inactive"].includes(status)) {
+      return res.status(400).send({ error: "Invalid status." });
+    }
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).send({ error: "Invalid item id." });
+    }
 
-  const result = await menuCollection.updateOne(
-    { _id: new ObjectId(req.params.id) },
-    { $set: { status } },
-  );
-  res.send(result);
-});
+    const result = await menuCollection.updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { status } },
+    );
+    res.send(result);
+  },
+);
 
 // Delete an inappropriate item.
-app.delete("/admin/menu-items/:id", verifyToken, verifyAdmin, async (req, res) => {
-  if (!ObjectId.isValid(req.params.id)) {
-    return res.status(400).send({ error: "Invalid item id." });
-  }
+app.delete(
+  "/admin/menu-items/:id",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).send({ error: "Invalid item id." });
+    }
 
-  const result = await menuCollection.deleteOne({
-    _id: new ObjectId(req.params.id),
-  });
-  res.send(result);
-});
+    const result = await menuCollection.deleteOne({
+      _id: new ObjectId(req.params.id),
+    });
+    res.send(result);
+  },
+);
 
 // Transactions - read only, admins cannot edit payment records.
 app.get("/admin/transactions", verifyToken, verifyAdmin, async (req, res) => {
-  const result = await paymentsCollection.find().toArray();
+  const result = await transactionsCollection.find().toArray();
   res.send(result);
 });
 
