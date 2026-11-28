@@ -8,6 +8,169 @@ const app = express();
 const port = 5000;
 
 app.use(cors());
+
+// Stripe webhook must come BEFORE express.json().
+// Stripe needs the original request body to verify its signature.
+app.post(
+  "/webhooks/stripe",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const signature = req.headers["stripe-signature"];
+
+    if (!signature) {
+      return res.status(400).send({ error: "Missing signature." });
+    }
+
+    let event;
+
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        signature,
+        process.env.STRIPE_WEBHOOK_SECRET,
+      );
+    } catch (error) {
+      console.error("Webhook signature verification failed:", error.message);
+      return res.status(400).send({ error: "Invalid signature." });
+    }
+
+    try {
+      if (event.type === "checkout.session.completed") {
+        const session = event.data.object;
+
+        // We only handle successful subscription checkouts.
+        if (
+          session.mode !== "subscription" ||
+          session.payment_status !== "paid"
+        ) {
+          return res.status(200).send({ received: true });
+        }
+
+        // Get the vendor ID and subscription ID.
+        const userId = session.metadata?.userId;
+
+        const subscriptionId =
+          typeof session.subscription === "string"
+            ? session.subscription
+            : session.subscription?.id;
+
+        if (!userId || !ObjectId.isValid(userId) || !subscriptionId) {
+          console.error("Missing or invalid vendor or subscription ID.");
+          return res.status(400).send({ error: "Invalid checkout metadata." });
+        }
+
+        // Get the latest subscription details from Stripe.
+        const subscription =
+          await stripe.subscriptions.retrieve(subscriptionId);
+
+        // Only active or trialing subscriptions receive Premium.
+        if (!["active", "trialing"].includes(subscription.status)) {
+          console.log("Subscription is not active yet:", subscription.status);
+          return res.status(200).send({ received: true });
+        }
+
+        // Convert the subscription expiry timestamp into a JavaScript Date.
+        const periodEnd =
+          subscription.current_period_end ??
+          subscription.items.data[0]?.current_period_end;
+
+        const expiresAt = periodEnd ? new Date(periodEnd * 1000) : null;
+
+        // Upgrade the vendor in MongoDB.
+        const userUpdate = await usersCollection.updateOne(
+          {
+            _id: new ObjectId(userId),
+            role: "vendor",
+          },
+          {
+            $set: {
+              subscriptionPlan: "premium",
+              subscriptionExpiresAt: expiresAt,
+            },
+          },
+        );
+
+        if (userUpdate.matchedCount === 0) {
+          throw new Error("Vendor account was not found.");
+        }
+
+        // Save the transaction only if it hasn't already been recorded.
+        // This also allows a Stripe retry to finish the user update
+        // if an earlier attempt failed partway through.
+        await transactionsCollection.updateOne(
+          { stripeSessionId: session.id },
+          {
+            $setOnInsert: {
+              vendorId: String(userId),
+              plan: "premium",
+              amount: session.amount_total ?? null,
+              currency: session.currency ?? null,
+              stripeSessionId: session.id,
+              stripeSubscriptionId: subscription.id,
+              status: session.payment_status,
+              createdAt: new Date(),
+            },
+          },
+          { upsert: true },
+        );
+
+        console.log("Vendor upgraded to Premium:", userId);
+      }
+
+      // Keep Premium in sync when a subscription changes.
+      // A subscription scheduled to cancel stays Premium until it actually ends.
+      if (
+        event.type === "customer.subscription.updated" ||
+        event.type === "customer.subscription.deleted"
+      ) {
+        const subscription = event.data.object;
+        const userId = subscription.metadata?.userId;
+
+        if (!userId || !ObjectId.isValid(userId)) {
+          console.error("Missing or invalid vendor id in subscription event.");
+          return res.status(400).send({ error: "Invalid subscription metadata." });
+        }
+
+        const isDeleted = event.type === "customer.subscription.deleted";
+        const isActive = ["active", "trialing"].includes(subscription.status);
+        const periodEnd =
+          subscription.current_period_end ??
+          subscription.items?.data?.[0]?.current_period_end;
+        const expiresAt = periodEnd ? new Date(periodEnd * 1000) : null;
+
+        if (isDeleted || !isActive) {
+          // Cancelled or no longer paid -> back to Free, clear expiry.
+          await usersCollection.updateOne(
+            { _id: new ObjectId(userId), role: "vendor" },
+            {
+              $set: {
+                subscriptionPlan: "free",
+                subscriptionExpiresAt: null,
+              },
+            }
+          );
+        } else {
+          // Still active (even if cancel_at_period_end) -> keep Premium.
+          await usersCollection.updateOne(
+            { _id: new ObjectId(userId), role: "vendor" },
+            {
+              $set: {
+                subscriptionPlan: "premium",
+                subscriptionExpiresAt: expiresAt,
+              },
+            }
+          );
+        }
+      }
+
+      return res.status(200).send({ received: true });
+    } catch (error) {
+      console.error("Stripe webhook processing failed:", error);
+      return res.status(500).send({ error: "Webhook processing failed." });
+    }
+  },
+);
+
 app.use(express.json());
 
 import { MongoClient, ObjectId } from "mongodb";
@@ -459,94 +622,6 @@ app.put("/cancel-order/:id", verifyToken, verifyCustomer, async (req, res) => {
   res.send({ message: "Order cancelled." });
 });
 
-//payments related apis
-app.post("/payments/checkout-verify", verifyToken, async (req, res) => {
-  const { sessionId } = req.body;
-
-  // No session id -> fail early with JSON.
-  if (typeof sessionId !== "string" || !sessionId) {
-    return res
-      .status(400)
-      .send({ success: false, message: "A sessionId is required." });
-  }
-
-  try {
-    const {
-      status,
-      payment_status,
-      customer_details,
-      metadata,
-      payment_intent,
-      subscription,
-    } = await stripe.checkout.sessions.retrieve(sessionId, {
-      expand: ["subscription"],
-    });
-
-    // userId lives inside metadata, and may be missing -> guard it.
-    const userId = metadata?.userId;
-
-    // subscription.current_period_end tells us when Premium expires.
-    let expiresAt = null;
-    const periodEnd = subscription?.items?.data?.[0]?.current_period_end;
-    if (periodEnd) {
-      expiresAt = new Date(periodEnd * 1000);
-    }
-
-    if (status === "complete" && payment_status === "paid") {
-      // Idempotency: one transaction per Stripe session.
-      const existing = await transactionsCollection.findOne({
-        stripeSessionId: sessionId,
-      });
-      if (existing) {
-        return res.send({
-          success: false,
-          message: "Payment already verified",
-        });
-      }
-
-      const transaction = {
-        vendorId: String(userId),
-        plan: "premium",
-        amount: session.amount_total ?? null,
-        currency: session.currency ?? null,
-        stripeSessionId: sessionId,
-        stripeSubscriptionId:
-          typeof subscription === "string"
-            ? subscription
-            : (subscription?.id ?? null),
-        status: payment_status,
-        createdAt: new Date(),
-      };
-      const result = await transactionsCollection.insertOne(transaction);
-
-      // updateOne needs TWO arguments: a filter and an update document.
-      // Activate Premium using the field the rest of the app reads.
-      const updatedResult = await usersCollection.updateOne(
-        { _id: new ObjectId(userId) },
-        {
-          $set: {
-            subscriptionPlan: "premium",
-            subscriptionExpiresAt: expiresAt,
-          },
-        },
-      );
-
-      // return -> stop here so the fallback below does not also run.
-      return res.send({ success: true, result, updatedResult });
-    }
-
-    // Session exists but is not paid/complete: answer instead of hanging.
-    return res.send({
-      success: false,
-      message: "Payment verification failed.",
-    });
-  } catch (error) {
-    return res
-      .status(500)
-      .send({ success: false, message: "Could not verify the payment." });
-  }
-});
-
 // Admin APIs - every one checks the JWT first, then the admin role.
 
 // Overview numbers for the admin dashboard.
@@ -681,8 +756,12 @@ app.get("/admin/transactions", verifyToken, verifyAdmin, async (req, res) => {
   res.send(result);
 });
 
-app.listen(port, () => {
-  console.log(`Example app listening on port ${port}`);
-});
+// Vercel imports the exported app as a serverless function and must not
+// call listen(). Locally we still need a normal Express server.
+if (process.env.VERCEL !== "1") {
+  app.listen(port, () => {
+    console.log(`Example app listening on port ${port}`);
+  });
+}
 
 export default app;
