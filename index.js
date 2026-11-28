@@ -316,17 +316,8 @@ app.delete(
   verifyToken,
   verifyVendor,
   async (req, res) => {
-    const vendorId = req.query.vendorId;
-
-    if (
-      typeof vendorId !== "string" ||
-      !vendorId ||
-      !ObjectId.isValid(vendorId) ||
-      !ObjectId.isValid(req.params.id)
-    ) {
-      return res
-        .status(400)
-        .send({ error: "A valid vendor id and item id are required." });
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).send({ error: "A valid item id is required." });
     }
 
     const item = await menuCollection.findOne({
@@ -335,7 +326,8 @@ app.delete(
     if (!item) {
       return res.status(404).send({ error: "Menu item not found." });
     }
-    if (String(item.vendorId) !== vendorId) {
+    // Ownership comes from the verified token, never from the URL.
+    if (String(item.vendorId) !== String(req.user._id)) {
       return res
         .status(403)
         .send({ error: "This item does not belong to you." });
