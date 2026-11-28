@@ -75,10 +75,25 @@ const verifyAdmin = (req, res, next) => {
 };
 
 // Same pattern for the other two roles.
-const verifyVendor = (req, res, next) => {
+const verifyVendor = async (req, res, next) => {
   if (req.user?.role !== "vendor") {
     return res.status(403).send({ message: "Forbidden" });
   }
+
+  // Expired Premium falls back to Free on the next vendor request.
+  const expiresAt = req.user.subscriptionExpiresAt;
+  if (
+    req.user.subscriptionPlan === "premium" &&
+    expiresAt &&
+    new Date(expiresAt) < new Date()
+  ) {
+    await usersCollection.updateOne(
+      { _id: req.user._id },
+      { $set: { subscriptionPlan: "free" } }
+    );
+    req.user.subscriptionPlan = "free";
+  }
+
   next();
 };
 
@@ -101,6 +116,18 @@ app.get("/users/:id/premium", async (req, res) => {
     { projection: { subscriptionPlan: 1 } },
   );
   res.send(result);
+});
+
+// Ids of vendors with a Premium subscription - used for the homepage badge
+// and to put their items first in the featured section.
+app.get("/premium-vendors", async (req, res) => {
+  const result = await usersCollection
+    .find(
+      { subscriptionPlan: "premium" },
+      { projection: { _id: 1 } }
+    )
+    .toArray();
+  res.send(result.map((user) => String(user._id)));
 });
 
 //menu related apis
@@ -144,7 +171,7 @@ app.post("/add-menu", verifyToken, verifyVendor, async (req, res) => {
 app.get("/add-menu/count", verifyToken, verifyVendor, async (req, res) => {
   // The vendor is the verified user - no id is trusted from the URL.
   const result = await menuCollection.countDocuments({
-    vendorId: req.user._id,
+    $or: [{ vendorId: String(req.user._id) }, { vendorId: req.user._id }],
     status: "approved",
   });
   res.send({ count: result });
@@ -204,7 +231,9 @@ app.get("/menuDetails/:id", async (req, res) => {
 
 app.get("/my-menu-items", verifyToken, verifyVendor, async (req, res) => {
   const result = await menuCollection
-    .find({ vendorId: req.user._id })
+    .find({
+      $or: [{ vendorId: String(req.user._id) }, { vendorId: req.user._id }],
+    })
     .sort({ createdAt: -1 }) // newest first
     .toArray();
 
@@ -310,8 +339,14 @@ app.delete("/delete-menu-item/:id", verifyToken, verifyVendor, async (req, res) 
 
 // Orders received by one vendor, newest first.
 app.get("/vendor-orders", verifyToken, verifyVendor, async (req, res) => {
+  // Stored vendorId is a string (older orders) or ObjectId (new ones).
   const result = await orderCollection
-    .find({ vendorId: req.user._id })
+    .find({
+      $or: [
+        { vendorId: String(req.user._id) },
+        { vendorId: req.user._id },
+      ],
+    })
     .sort({ createdAt: -1 })
     .toArray();
   res.send(result);
@@ -331,7 +366,7 @@ app.patch("/update-order-status/:id", verifyToken, verifyVendor, async (req, res
   // vendorId comes from the token, not the request body.
   const query = {
     _id: new ObjectId(req.params.id),
-    vendorId: req.user._id,
+    $or: [{ vendorId: String(req.user._id) }, { vendorId: req.user._id }],
     status: "pending",
   };
   const result = await orderCollection.updateOne(query, {
@@ -379,8 +414,14 @@ app.post("/orders", verifyToken, verifyCustomer, async (req, res) => {
 
 // Orders belonging to one customer, newest first.
 app.get("/my-orders", verifyToken, verifyCustomer, async (req, res) => {
+  // customerId is a string in seeded orders and an ObjectId in newer ones.
   const result = await orderCollection
-    .find({ customerId: req.user._id })
+    .find({
+      $or: [
+        { customerId: String(req.user._id) },
+        { customerId: req.user._id },
+      ],
+    })
     .sort({ createdAt: -1 })
     .toArray();
   res.send(result);
@@ -398,8 +439,9 @@ app.put("/cancel-order/:id", verifyToken, verifyCustomer, async (req, res) => {
   if (!order) {
     return res.status(404).send({ error: "Order not found." });
   }
-  // Ownership comes from the verified token.
-  if (order.customerId !== String(req.user._id)) {
+  // Ownership comes from the verified token. Stored customerId may be a
+  // string (seeded orders) or an ObjectId (orders created in the app).
+  if (String(order.customerId) !== String(req.user._id)) {
     return res
       .status(403)
       .send({ error: "This order does not belong to you." });
@@ -435,10 +477,20 @@ app.post("/payments/checkout-verify", verifyToken, async (req, res) => {
       customer_details,
       metadata,
       payment_intent,
-    } = await stripe.checkout.sessions.retrieve(sessionId);
+      subscription,
+    } = await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ["subscription"],
+    });
 
     // userId lives inside metadata, and may be missing -> guard it.
     const userId = metadata?.userId;
+
+    // subscription.current_period_end tells us when Premium expires.
+    let expiresAt = null;
+    const periodEnd = subscription?.items?.data?.[0]?.current_period_end;
+    if (periodEnd) {
+      expiresAt = new Date(periodEnd * 1000);
+    }
 
     if (status === "complete" && payment_status === "paid") {
       const sessionQuery = { sessionId };
@@ -463,7 +515,7 @@ app.post("/payments/checkout-verify", verifyToken, async (req, res) => {
       // Activate Premium using the field the rest of the app reads.
       const updatedResult = await usersCollection.updateOne(
         { _id: new ObjectId(userId) },
-        { $set: { subscriptionPlan: "premium" } },
+        { $set: { subscriptionPlan: "premium", subscriptionExpiresAt: expiresAt } },
       );
 
       // return -> stop here so the fallback below does not also run.
